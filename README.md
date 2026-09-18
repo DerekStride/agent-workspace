@@ -2,35 +2,29 @@
 
 `agent-workspace` is an optional OMP extension that provisions a lightweight, per-session temporary workspace folder and injects branch-persistent instructions for coding agents.
 
-It gives agents a dedicated scratchpad directory for notes, plans, drafts, and handoff material that survives conversation compaction.
+It gives agents a dedicated scratch directory for temporary working files that survive conversation compaction without becoming repository changes.
 
 ## Responsibilities & Boundaries
 
-- **Workspace Folder**: Creates a per-session directory under `$TMPDIR/agent-workspace/sessions/<slug-or-id>`.
+- **Workspace Folder**: Creates a per-session directory at `/tmp/agent-workspace/<slug-or-id>` by default.
 - **Friendly Slug**: Resolves the human-readable slug using `agent-id` when available; falls back cleanly to the session ID.
-- **Compaction-Safe Context**: Injects one hidden, branch-persistent context message (`dev.derekstride.agent-workspace.context-v1`) directing the agent to store working artifacts in the workspace.
-- **Cache-Friendly**: Checks the current branch for the stable custom message type before injecting, preventing prompt-cache churn.
+- **Compaction Recovery**: Injects a hidden workspace instruction (`dev.derekstride.agent-workspace.context-v1`) initially and again after each compaction.
+- **Duplicate Prevention**: Checks branch entries since the latest compaction before injecting, so historical instructions do not block reinsertion and repeated lifecycle events do not add duplicates.
 - **Environment Context**: Exposes `AGENT_WORKSPACE_PATH` in the process environment.
 - **No Overlapping Responsibilities**: Does not allocate identities (owned by `agent-id`) or manage Maildir transport/read states (owned by `agent-mail`).
 
 ## Storage Model
 
 ```text
-$AGENT_WORKSPACE_ROOT/ (defaults to $TMPDIR/agent-workspace)
-└── sessions/<slug-or-session-id>/
-    └── metadata.json
+$AGENT_WORKSPACE_ROOT/ (defaults to /tmp/agent-workspace)
+└── <slug-or-session-id>/
 ```
 
-The workspace directory is intended for agents to place files such as notes, plans, scripts, and drafts:
+New workspaces are empty: no `metadata.json` or preset subdirectories. Agents choose the files and layout appropriate to the task. Initializing an existing workspace preserves its contents.
 
-```text
-<workspace>/
-├── metadata.json
-├── notes/
-├── plans/
-├── drafts/
-└── handoff/
-```
+Set `AGENT_WORKSPACE_ROOT` to override the root. `AGENT_WORKSPACE_PATH` contains the full current session directory. Temporary files survive conversation compaction, but may be removed by system cleanup.
+
+Existing workspaces from the previous OS-temporary-directory and `sessions/` layout are not moved or deleted.
 
 ## Installation
 

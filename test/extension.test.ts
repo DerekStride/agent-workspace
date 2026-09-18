@@ -2,15 +2,13 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-  buildContextMessageContent,
-  ensureWorkspaceContextMessage,
+import agentWorkspaceExtension, {
   ensureWorkspaceDirectory,
-  hasWorkspaceContextMessage,
   resolveWorkspaceRoot,
   sanitizePathComponent,
   WORKSPACE_CONTEXT_MESSAGE_TYPE,
   type ContextMessage,
+  type ExtensionAPI,
   type SessionContext,
 } from "../extensions/agent-workspace.js";
 
@@ -22,15 +20,19 @@ describe("agent-workspace extension", () => {
   });
 
   it("resolves default and custom workspace roots", () => {
-    delete process.env.AGENT_WORKSPACE_ROOT;
-    expect(resolveWorkspaceRoot()).toBe(path.join(os.tmpdir(), "agent-workspace"));
-
-    process.env.AGENT_WORKSPACE_ROOT = "/custom/root";
-    expect(resolveWorkspaceRoot()).toBe("/custom/root");
-    delete process.env.AGENT_WORKSPACE_ROOT;
+    const previousRoot = process.env.AGENT_WORKSPACE_ROOT;
+    try {
+      delete process.env.AGENT_WORKSPACE_ROOT;
+      expect(resolveWorkspaceRoot()).toBe("/tmp/agent-workspace");
+      process.env.AGENT_WORKSPACE_ROOT = "/custom/root";
+      expect(resolveWorkspaceRoot()).toBe("/custom/root");
+    } finally {
+      if (previousRoot === undefined) delete process.env.AGENT_WORKSPACE_ROOT;
+      else process.env.AGENT_WORKSPACE_ROOT = previousRoot;
+    }
   });
 
-  it("creates workspace directory and writes metadata", () => {
+  it("creates an empty workspace and preserves files on subsequent initialization", () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-test-"));
     try {
       const sessionId = "session-123";
@@ -40,18 +42,14 @@ describe("agent-workspace extension", () => {
         slug: "oriole-thatcher-lighthouse",
       };
 
-      const { workspacePath, metadataPath } = ensureWorkspaceDirectory(tempRoot, sessionId, identity);
-      expect(workspacePath).toBe(path.join(tempRoot, "sessions", "oriole-thatcher-lighthouse"));
-      expect(fs.existsSync(workspacePath)).toBe(true);
-      expect(fs.existsSync(metadataPath)).toBe(true);
-      for (const directory of ["notes", "plans", "drafts", "handoff"]) {
-        expect(fs.existsSync(path.join(workspacePath, directory))).toBe(true);
-      }
+      const { workspacePath } = ensureWorkspaceDirectory(tempRoot, sessionId, identity);
+      expect(workspacePath).toBe(path.join(tempRoot, "oriole-thatcher-lighthouse"));
+      expect(fs.readdirSync(workspacePath)).toEqual([]);
 
-      const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf-8"));
-      expect(metadata.session_id).toBe(sessionId);
-      expect(metadata.slug).toBe("oriole-thatcher-lighthouse");
-      expect(metadata.name).toBe("Oriole Thatcher of Lighthouse");
+      fs.writeFileSync(path.join(workspacePath, "scratch.txt"), "keep my work");
+      ensureWorkspaceDirectory(tempRoot, sessionId, identity);
+      expect(fs.readdirSync(workspacePath)).toEqual(["scratch.txt"]);
+      expect(fs.readFileSync(path.join(workspacePath, "scratch.txt"), "utf-8")).toBe("keep my work");
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
@@ -62,44 +60,65 @@ describe("agent-workspace extension", () => {
     try {
       const sessionId = "session-raw-456";
       const { workspacePath } = ensureWorkspaceDirectory(tempRoot, sessionId, null);
-      expect(workspacePath).toBe(path.join(tempRoot, "sessions", "session-raw-456"));
+      expect(workspacePath).toBe(path.join(tempRoot, "session-raw-456"));
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   });
 
-  it("detects and injects branch-persistent context messages exactly once", () => {
-    const sentMessages: ContextMessage[] = [];
+  it("restores workspace guidance after compaction and resume without duplicates", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-test-"));
+    const previousEnvironment = ["AGENT_WORKSPACE_ROOT", "AGENT_WORKSPACE_PATH", "PATH"]
+      .map((key) => [key, process.env[key]] as const);
     const entries: unknown[] = [];
-
+    const sentMessages: ContextMessage[] = [];
+    const handlers = new Map<string, (event: unknown, context: SessionContext) => void>();
     const context: SessionContext = {
       sessionManager: {
         getSessionId: () => "session-abc",
         getBranch: () => entries,
       },
     };
+    const api: ExtensionAPI = {
+      on(event, handler) { handlers.set(event, handler); },
+      sendMessage(message) {
+        sentMessages.push(message);
+        entries.push({ type: "custom_message", ...message });
+      },
+    };
 
-    expect(hasWorkspaceContextMessage(entries)).toBe(false);
+    try {
+      process.env.AGENT_WORKSPACE_ROOT = tempRoot;
+      process.env.PATH = ""; // Exercise the optional-Agent-ID fallback, not the user's registry.
+      agentWorkspaceExtension(api);
+      handlers.get("session_start")?.({}, context);
+      handlers.get("session_start")?.({}, context);
+      expect(sentMessages).toHaveLength(1);
+      expect(sentMessages[0].display).toBe(false);
+      expect(sentMessages[0].content).toContain(process.env.AGENT_WORKSPACE_PATH!);
 
-    ensureWorkspaceContextMessage(context, "/tmp/agent-workspace/sessions/slug", (msg) => {
-      sentMessages.push(msg);
-      entries.push({
+      entries.push({ type: "compaction" });
+      handlers.get("session_compact")?.({}, context);
+      expect(sentMessages).toHaveLength(2);
+      expect(entries.at(-1)).toMatchObject({
         type: "custom_message",
-        customType: msg.customType,
-        content: msg.content,
+        customType: WORKSPACE_CONTEXT_MESSAGE_TYPE,
       });
-    });
+      handlers.get("session_compact")?.({}, context);
+      expect(sentMessages).toHaveLength(2);
 
-    expect(sentMessages.length).toBe(1);
-    expect(sentMessages[0].customType).toBe(WORKSPACE_CONTEXT_MESSAGE_TYPE);
-    expect(sentMessages[0].content).toBe(buildContextMessageContent("/tmp/agent-workspace/sessions/slug"));
-    expect(hasWorkspaceContextMessage(entries)).toBe(true);
-
-    // Second run: no duplicate message inserted
-    ensureWorkspaceContextMessage(context, "/tmp/agent-workspace/sessions/slug", (msg) => {
-      sentMessages.push(msg);
-    });
-
-    expect(sentMessages.length).toBe(1);
+      // Resume a branch compacted before the extension could restore its instruction.
+      entries.push({ type: "compaction" });
+      agentWorkspaceExtension(api);
+      handlers.get("session_start")?.({}, context);
+      handlers.get("session_switch")?.({}, context);
+      expect(sentMessages).toHaveLength(3);
+    } finally {
+      for (const [key, value] of previousEnvironment) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 });
