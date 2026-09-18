@@ -121,4 +121,63 @@ describe("agent-workspace extension", () => {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   });
+
+  it("gives a fork its own workspace instruction despite inherited parent history", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-test-"));
+    const previousEnvironment = ["AGENT_WORKSPACE_ROOT", "AGENT_WORKSPACE_PATH", "PATH"]
+      .map((key) => [key, process.env[key]] as const);
+    let sessionId = "parent-session";
+    let entries: unknown[] = [];
+    const sentMessages: ContextMessage[] = [];
+    const handlers = new Map<string, (event: unknown, context: SessionContext) => void>();
+    const context: SessionContext = {
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getBranch: () => entries,
+      },
+    };
+    const api: ExtensionAPI = {
+      on(event, handler) { handlers.set(event, handler); },
+      sendMessage(message) {
+        sentMessages.push(message);
+        entries.push({ type: "custom_message", ...message });
+      },
+    };
+
+    try {
+      process.env.AGENT_WORKSPACE_ROOT = tempRoot;
+      process.env.PATH = "";
+      agentWorkspaceExtension(api);
+      handlers.get("session_start")?.({}, context);
+      const parentEntries = entries;
+      const parentWorkspace = process.env.AGENT_WORKSPACE_PATH!;
+
+      sessionId = "fork-session";
+      entries = [...parentEntries];
+      handlers.get("session_branch")?.({}, context);
+      const forkWorkspace = path.join(tempRoot, sessionId);
+      expect(process.env.AGENT_WORKSPACE_PATH).toBe(forkWorkspace);
+      expect(fs.readdirSync(forkWorkspace)).toEqual([]);
+      expect(sentMessages).toHaveLength(2);
+      expect(sentMessages[1].content).toContain(forkWorkspace);
+      expect(sentMessages[1].content).not.toContain(parentWorkspace);
+      expect(sentMessages[1].display).toBe(false);
+
+      handlers.get("session_branch")?.({}, context);
+      handlers.get("session_start")?.({}, context);
+      expect(sentMessages).toHaveLength(2);
+
+      sessionId = "parent-session";
+      entries = parentEntries;
+      handlers.get("session_switch")?.({}, context);
+      expect(process.env.AGENT_WORKSPACE_PATH).toBe(parentWorkspace);
+      expect(sentMessages).toHaveLength(2);
+    } finally {
+      for (const [key, value] of previousEnvironment) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
 });

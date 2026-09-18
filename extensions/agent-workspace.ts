@@ -8,12 +8,14 @@ export const WORKSPACE_CONTEXT_MESSAGE_TYPE = "dev.derekstride.agent-workspace.c
 export type SessionEntryLike = {
   type?: unknown;
   customType?: unknown;
+  details?: { sessionId?: unknown };
 };
 
 export type ContextMessage = {
   customType: string;
   content: string;
   display: boolean;
+  details: { sessionId: string };
 };
 
 export type SessionContext = {
@@ -26,7 +28,7 @@ export type SessionContext = {
 export type ExtensionAPI = {
   on(event: "session_start", handler: (event: unknown, context: SessionContext) => void): void;
   on(event: "session_switch", handler: (event: unknown, context: SessionContext) => void): void;
-  on(event: "session_fork", handler: (event: unknown, context: SessionContext) => void): void;
+  on(event: "session_branch", handler: (event: unknown, context: SessionContext) => void): void;
   on(event: "session_compact", handler: (event: unknown, context: SessionContext) => void): void;
   on(event: "session_shutdown", handler: (event: unknown, context: SessionContext) => void): void;
   sendMessage(message: ContextMessage): void;
@@ -85,14 +87,15 @@ export function buildContextMessageContent(workspacePath: string): string {
   ].join("\n");
 }
 
-export function hasWorkspaceContextMessage(entries: readonly unknown[]): boolean {
-  // A historical instruction must not suppress reinsertion after compaction.
+export function hasWorkspaceContextMessage(entries: readonly unknown[], sessionId: string): boolean {
+  // Parent-session and compacted instructions must not suppress current guidance.
   for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index];
     if (!entry || typeof entry !== "object") continue;
     const candidate = entry as SessionEntryLike;
     if (candidate.type === "compaction") return false;
-    if (candidate.type === "custom_message" && candidate.customType === WORKSPACE_CONTEXT_MESSAGE_TYPE) {
+    if (candidate.type === "custom_message" && candidate.customType === WORKSPACE_CONTEXT_MESSAGE_TYPE &&
+      candidate.details?.sessionId === sessionId) {
       return true;
     }
   }
@@ -104,13 +107,15 @@ export function ensureWorkspaceContextMessage(
   workspacePath: string,
   sendMessage: (message: ContextMessage) => void,
 ): void {
-  if (hasWorkspaceContextMessage(context.sessionManager.getBranch())) {
+  const sessionId = context.sessionManager.getSessionId();
+  if (hasWorkspaceContextMessage(context.sessionManager.getBranch(), sessionId)) {
     return;
   }
   sendMessage({
     customType: WORKSPACE_CONTEXT_MESSAGE_TYPE,
     content: buildContextMessageContent(workspacePath),
     display: false,
+    details: { sessionId },
   });
 }
 
@@ -132,7 +137,7 @@ export default function agentWorkspaceExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", handleSession);
   pi.on("session_switch", handleSession);
-  pi.on("session_fork", handleSession);
+  pi.on("session_branch", handleSession);
   pi.on("session_compact", handleSession);
   pi.on("session_shutdown", () => {
     delete process.env[WORKSPACE_PATH_ENV];

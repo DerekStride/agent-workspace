@@ -9,7 +9,7 @@ It gives agents a dedicated scratch directory for temporary working files that s
 - **Workspace Folder**: Creates a per-session directory at `/tmp/agent-workspace/<slug-or-id>` by default.
 - **Friendly Slug**: Resolves the human-readable slug using `agent-id` when available; falls back cleanly to the session ID.
 - **Compaction Recovery**: Injects a hidden workspace instruction (`dev.derekstride.agent-workspace.context-v1`) initially and again after each compaction.
-- **Duplicate Prevention**: Checks branch entries since the latest compaction before injecting, so historical instructions do not block reinsertion and repeated lifecycle events do not add duplicates.
+- **Duplicate Prevention**: Matches instructions to the current session ID and checks only entries since the latest compaction. Forks get their own workspace guidance even when they inherit a parent's instruction; repeated lifecycle events do not add duplicates.
 - **Environment Context**: Exposes `AGENT_WORKSPACE_PATH` in the process environment.
 - **No Overlapping Responsibilities**: Does not allocate identities (owned by `agent-id`) or manage Maildir transport/read states (owned by `agent-mail`).
 
