@@ -143,6 +143,47 @@ test("refreshes guidance when the resolved path changes and keeps old directorie
   }
 });
 
+test("clears its owned path when reprovisioning fails and recovers on retry", () => {
+  const h = harness("pi-session");
+  agentWorkspaceExtension(h.api);
+  h.fire("session_start", { reason: "startup" });
+  const owned = process.env.AGENT_WORKSPACE_PATH!;
+  fs.writeFileSync(path.join(owned, "keep.txt"), "keep my work");
+  h.state.entries.push({ type: "compaction" });
+  const blockedRoot = path.join(root, "not-a-directory");
+  fs.writeFileSync(blockedRoot, "blocked");
+  process.env.AGENT_WORKSPACE_ROOT = blockedRoot;
+
+  assert.throws(() => h.fire("session_compact"));
+  assert.equal(process.env.AGENT_WORKSPACE_PATH, undefined);
+  assert.equal(h.sent.length, 1);
+  const call = { toolName: "bash", input: { command: "pwd", timeout: 5 } };
+  assert.equal(h.handlers.get("tool_call")!(call, h.context), undefined);
+  assert.deepEqual(call.input, { command: "pwd", timeout: 5 });
+
+  process.env.AGENT_WORKSPACE_ROOT = root;
+  h.fire("session_compact");
+  assert.equal(process.env.AGENT_WORKSPACE_PATH, owned);
+  assert.equal(h.sent.length, 2);
+  assert.equal(fs.readFileSync(path.join(owned, "keep.txt"), "utf8"), "keep my work");
+});
+
+test("does not export a workspace until its context is published", () => {
+  const h = harness("pi-session");
+  const sendMessage = h.api.sendMessage;
+  h.api.sendMessage = () => { throw new Error("context unavailable"); };
+  agentWorkspaceExtension(h.api);
+
+  assert.throws(() => h.fire("session_start", { reason: "startup" }), /context unavailable/);
+  assert.equal(process.env.AGENT_WORKSPACE_PATH, undefined);
+  assert.equal(h.sent.length, 0);
+
+  h.api.sendMessage = sendMessage;
+  h.fire("session_start", { reason: "startup" });
+  assert.equal(process.env.AGENT_WORKSPACE_PATH, path.join(root, "pi-session"));
+  assert.equal(h.sent.length, 1);
+});
+
 test("legacy instruction naming the current path still dedupes", () => {
   const h = harness("pi-session");
   h.state.entries.push(legacyInstruction("pi-session", path.join(root, "pi-session"), WORKSPACE_CONTEXT_MESSAGE_TYPE));

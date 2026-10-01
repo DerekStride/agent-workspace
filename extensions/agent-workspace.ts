@@ -130,17 +130,29 @@ export function setupWorkspaceSession(context: SessionContext, pi: ExtensionAPI)
   const root = resolveWorkspaceRoot();
   const { workspacePath } = ensureWorkspaceDirectory(root, sessionId, identity);
 
-  process.env[WORKSPACE_PATH_ENV] = workspacePath;
   ensureWorkspaceContextMessage(context, workspacePath, (msg) => pi.sendMessage(msg));
+  process.env[WORKSPACE_PATH_ENV] = workspacePath;
   return workspacePath;
 }
 
 export default function agentWorkspaceExtension(pi: ExtensionAPI): void {
   // Instance state: host detection and the path this instance exported.
   let adapter: HostAdapter | undefined;
-  let ownedPath: string | undefined;
+  // null marks failed setup; undefined means this instance is inactive.
+  let ownedPath: string | null | undefined;
+
+  const clearOwnedPath = () => {
+    // A replacement runtime may already own the process value.
+    if (typeof ownedPath === "string" && process.env[WORKSPACE_PATH_ENV] === ownedPath) {
+      delete process.env[WORKSPACE_PATH_ENV];
+    }
+    ownedPath = undefined;
+  };
 
   const handleSession = (_event: unknown, context: SessionContext) => {
+    clearOwnedPath();
+    // Keep failed setup distinct from shutdown so OMP clears stale shell exports.
+    ownedPath = null;
     ownedPath = setupWorkspaceSession(context, pi);
   };
 
@@ -155,12 +167,5 @@ export default function agentWorkspaceExtension(pi: ExtensionAPI): void {
   });
   pi.on("session_compact", handleSession);
   pi.on("tool_call", (event) => adapter?.exposeWorkspacePath(event, ownedPath));
-  pi.on("session_shutdown", () => {
-    // Only clear a value this instance exported; a replacement runtime may
-    // already own the variable.
-    if (ownedPath !== undefined && process.env[WORKSPACE_PATH_ENV] === ownedPath) {
-      delete process.env[WORKSPACE_PATH_ENV];
-    }
-    ownedPath = undefined;
-  });
+  pi.on("session_shutdown", clearOwnedPath);
 }

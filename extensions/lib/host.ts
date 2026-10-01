@@ -62,9 +62,10 @@ export type HostAdapter = {
    * `export` in that shell (no subshell, so `cd` and other shell-local state
    * keep working). Composable contract shared with sibling adapters: mutate
    * `event.input` in place AND return that same object as `{ input }`, so any
-   * handler order composes under OMP's last-result-wins runner.
+   * handler order composes under OMP's last-result-wins runner. A null path
+   * marks failed setup and unsets the shell export; undefined leaves it alone.
    */
-  exposeWorkspacePath(event: unknown, workspacePath: string | undefined): InputReplacement | void;
+  exposeWorkspacePath(event: unknown, workspacePath: string | null | undefined): InputReplacement | void;
 };
 
 export const WORKSPACE_PATH_ENV = "AGENT_WORKSPACE_PATH";
@@ -95,10 +96,11 @@ export function createHostAdapter(context: SessionContext): HostAdapter {
         api.on("session_tree", refresh);
       },
       exposeWorkspacePath(event, workspacePath) {
-        if (!workspacePath) return;
+        if (workspacePath === undefined) return;
         const call = bashCall(event);
         if (!call) return;
-        call.input.command = exportPrefix(workspacePath) + (call.input.command as string);
+        const prefix = workspacePath === null ? `unset ${WORKSPACE_PATH_ENV};\n` : exportPrefix(workspacePath);
+        call.input.command = prefix + (call.input.command as string);
         return { input: call.input };
       },
     };

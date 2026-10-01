@@ -27,7 +27,7 @@ agent-workspace provisions one temporary directory per session under `$AGENT_WOR
 
 `hasWorkspaceContextMessage()` walks the current branch backwards from the leaf: a `compaction` entry ends the search (re-inject), and the most recent own `custom_message` (`details.sessionId` equals the current session) decides. It satisfies the check only when it names the currently resolved path (`details.workspacePath`, or the path parsed from legacy message content), so guidance is refreshed when the resolved directory changes (identity availability or `AGENT_WORKSPACE_ROOT`), including A → B → A, while same-path reloads still dedupe. Older directories and their files are never moved or deleted. Inherited parent-session messages never suppress a fork's own instruction.
 
-Each extension instance remembers the path it exported. `session_shutdown` deletes `AGENT_WORKSPACE_PATH` only when the process value still equals that path, so a replacement runtime that already exported its own value is left alone. Cleanup is idempotent.
+Each extension instance remembers the path it exported. Before re-provisioning, it releases its previous path and publishes the new environment value only after workspace setup and guidance succeed. Failed setup leaves the workspace unavailable until a successful retry; OMP Bash calls explicitly unset any stale shell export in the meantime. Re-provisioning and `session_shutdown` delete `AGENT_WORKSPACE_PATH` only when the process value still equals the owned path, so a replacement runtime that already exported its own value is left alone. Cleanup is idempotent.
 
 ## OMP and Pi host adapter
 
