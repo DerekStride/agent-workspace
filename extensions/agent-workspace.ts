@@ -1,38 +1,27 @@
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import {
+  type ContextMessage,
+  createHostAdapter,
+  type ExtensionAPI,
+  type HostAdapter,
+  type SessionContext,
+  WORKSPACE_PATH_ENV,
+} from "./lib/host.ts";
+
+export { WORKSPACE_PATH_ENV };
 
 export const WORKSPACE_ROOT_ENV = "AGENT_WORKSPACE_ROOT";
-export const WORKSPACE_PATH_ENV = "AGENT_WORKSPACE_PATH";
 export const WORKSPACE_CONTEXT_MESSAGE_TYPE = "dev.derekstride.agent-workspace.context-v1";
 export type SessionEntryLike = {
   type?: unknown;
   customType?: unknown;
-  details?: { sessionId?: unknown };
+  content?: unknown;
+  details?: { sessionId?: unknown; workspacePath?: unknown };
 };
 
-export type ContextMessage = {
-  customType: string;
-  content: string;
-  display: boolean;
-  details: { sessionId: string };
-};
-
-export type SessionContext = {
-  sessionManager: {
-    getSessionId(): string;
-    getBranch(): readonly unknown[];
-  };
-};
-
-export type ExtensionAPI = {
-  on(event: "session_start", handler: (event: unknown, context: SessionContext) => void): void;
-  on(event: "session_switch", handler: (event: unknown, context: SessionContext) => void): void;
-  on(event: "session_branch", handler: (event: unknown, context: SessionContext) => void): void;
-  on(event: "session_compact", handler: (event: unknown, context: SessionContext) => void): void;
-  on(event: "session_shutdown", handler: (event: unknown, context: SessionContext) => void): void;
-  sendMessage(message: ContextMessage): void;
-};
+export type { ContextMessage, ExtensionAPI, SessionContext } from "./lib/host.ts";
 
 export type AgentIdLookup = {
   session_id: string;
@@ -45,6 +34,8 @@ export function lookupAgentIdentity(sessionId: string): AgentIdLookup | null {
     const output = execFileSync("agent-id", ["lookup", sessionId, "--json"], {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
+      // Bun resolves PATH from the environment passed to the child, not from live process.env.
+      env: process.env,
     });
     const parsed = JSON.parse(output) as AgentIdLookup;
     if (parsed && typeof parsed === "object" && parsed.session_id === sessionId) {
@@ -87,8 +78,22 @@ export function buildContextMessageContent(workspacePath: string): string {
   ].join("\n");
 }
 
-export function hasWorkspaceContextMessage(entries: readonly unknown[], sessionId: string): boolean {
+/** Path named by an instruction: `details.workspacePath`, or parsed from legacy message content. */
+export function instructionWorkspacePath(entry: SessionEntryLike): string | undefined {
+  const fromDetails = entry.details?.workspacePath;
+  if (typeof fromDetails === "string") return fromDetails;
+  const match = typeof entry.content === "string" ? /workspace at `([^`]+)`/.exec(entry.content) : null;
+  return match?.[1];
+}
+
+export function hasWorkspaceContextMessage(
+  entries: readonly unknown[],
+  sessionId: string,
+  workspacePath: string,
+): boolean {
   // Parent-session and compacted instructions must not suppress current guidance.
+  // Only the most recent own instruction counts: it must describe the current path,
+  // so an older match cannot mask newer guidance that names a different directory.
   for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index];
     if (!entry || typeof entry !== "object") continue;
@@ -96,7 +101,7 @@ export function hasWorkspaceContextMessage(entries: readonly unknown[], sessionI
     if (candidate.type === "compaction") return false;
     if (candidate.type === "custom_message" && candidate.customType === WORKSPACE_CONTEXT_MESSAGE_TYPE &&
       candidate.details?.sessionId === sessionId) {
-      return true;
+      return instructionWorkspacePath(candidate) === workspacePath;
     }
   }
   return false;
@@ -108,14 +113,14 @@ export function ensureWorkspaceContextMessage(
   sendMessage: (message: ContextMessage) => void,
 ): void {
   const sessionId = context.sessionManager.getSessionId();
-  if (hasWorkspaceContextMessage(context.sessionManager.getBranch(), sessionId)) {
+  if (hasWorkspaceContextMessage(context.sessionManager.getBranch(), sessionId, workspacePath)) {
     return;
   }
   sendMessage({
     customType: WORKSPACE_CONTEXT_MESSAGE_TYPE,
     content: buildContextMessageContent(workspacePath),
     display: false,
-    details: { sessionId },
+    details: { sessionId, workspacePath },
   });
 }
 
@@ -131,15 +136,31 @@ export function setupWorkspaceSession(context: SessionContext, pi: ExtensionAPI)
 }
 
 export default function agentWorkspaceExtension(pi: ExtensionAPI): void {
+  // Instance state: host detection and the path this instance exported.
+  let adapter: HostAdapter | undefined;
+  let ownedPath: string | undefined;
+
   const handleSession = (_event: unknown, context: SessionContext) => {
-    setupWorkspaceSession(context, pi);
+    ownedPath = setupWorkspaceSession(context, pi);
   };
 
-  pi.on("session_start", handleSession);
-  pi.on("session_switch", handleSession);
-  pi.on("session_branch", handleSession);
+  pi.on("session_start", (event, context) => {
+    if (!adapter) {
+      // Lazy: host capabilities are only observable on a context, so detect on
+      // the first shared event and register host transitions once per instance.
+      adapter = createHostAdapter(context);
+      adapter.onSessionChange(pi, handleSession);
+    }
+    handleSession(event, context);
+  });
   pi.on("session_compact", handleSession);
+  pi.on("tool_call", (event) => adapter?.exposeWorkspacePath(event, ownedPath));
   pi.on("session_shutdown", () => {
-    delete process.env[WORKSPACE_PATH_ENV];
+    // Only clear a value this instance exported; a replacement runtime may
+    // already own the variable.
+    if (ownedPath !== undefined && process.env[WORKSPACE_PATH_ENV] === ownedPath) {
+      delete process.env[WORKSPACE_PATH_ENV];
+    }
+    ownedPath = undefined;
   });
 }
