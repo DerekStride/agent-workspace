@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -71,7 +70,6 @@ describe("agent-workspace shared behavior (OMP host)", () => {
       const h = harness("omp-session");
       agentWorkspaceExtension(h.api);
       h.fire("session_start");
-      expect(process.env.AGENT_WORKSPACE_PATH).toBe(path.join(root, "oriole-thatcher-lighthouse"));
       expect(h.sent[0].details).toEqual({ sessionId: "omp-session", workspacePath: path.join(root, "oriole-thatcher-lighthouse") });
     } finally {
       fs.rmSync(fake.bin, { recursive: true, force: true });
@@ -112,7 +110,6 @@ describe("agent-workspace shared behavior (OMP host)", () => {
       process.env.PATH = fake.PATH;
       h.fire("session_switch", { type: "session_switch", reason: "resume" });
       const slugPath = path.join(root, "late-slug");
-      expect(process.env.AGENT_WORKSPACE_PATH).toBe(slugPath);
       expect(h.sent).toHaveLength(2);
       expect(h.sent[1].details.workspacePath).toBe(slugPath);
       expect(h.sent[1].content).toContain(slugPath);
@@ -128,7 +125,6 @@ describe("agent-workspace shared behavior (OMP host)", () => {
     // Identity unavailable again (A -> B -> A): refresh despite the older A instruction.
     process.env.PATH = "";
     h.fire("session_switch", { type: "session_switch", reason: "resume" });
-    expect(process.env.AGENT_WORKSPACE_PATH).toBe(rawPath);
     expect(h.sent).toHaveLength(3);
     expect(h.sent[2].details.workspacePath).toBe(rawPath);
 
@@ -144,41 +140,37 @@ describe("agent-workspace shared behavior (OMP host)", () => {
     }
   });
 
-  it("clears its owned path when reprovisioning fails and recovers on retry", () => {
+  it("failed reprovisioning preserves workspace files and recovers on retry", () => {
     const h = harness("omp-session");
     agentWorkspaceExtension(h.api);
     h.fire("session_start");
-    const owned = process.env.AGENT_WORKSPACE_PATH!;
-    fs.writeFileSync(path.join(owned, "keep.txt"), "keep my work");
+    const workspace = path.join(root, "omp-session");
+    fs.writeFileSync(path.join(workspace, "keep.txt"), "keep my work");
     h.state.entries.push({ type: "compaction" });
     const blockedRoot = path.join(root, "not-a-directory");
     fs.writeFileSync(blockedRoot, "blocked");
     process.env.AGENT_WORKSPACE_ROOT = blockedRoot;
 
     expect(() => h.fire("session_compact")).toThrow();
-    expect(process.env.AGENT_WORKSPACE_PATH).toBeUndefined();
     expect(h.sent).toHaveLength(1);
 
     process.env.AGENT_WORKSPACE_ROOT = root;
     h.fire("session_compact");
-    expect(process.env.AGENT_WORKSPACE_PATH).toBe(owned);
     expect(h.sent).toHaveLength(2);
-    expect(fs.readFileSync(path.join(owned, "keep.txt"), "utf8")).toBe("keep my work");
+    expect(fs.readFileSync(path.join(workspace, "keep.txt"), "utf8")).toBe("keep my work");
   });
 
-  it("does not export a workspace until its context is published", () => {
+  it("does not publish workspace guidance until setup succeeds", () => {
     const h = harness("omp-session");
     const sendMessage = h.api.sendMessage;
     h.api.sendMessage = () => { throw new Error("context unavailable"); };
     agentWorkspaceExtension(h.api);
 
     expect(() => h.fire("session_start")).toThrow("context unavailable");
-    expect(process.env.AGENT_WORKSPACE_PATH).toBeUndefined();
     expect(h.sent).toHaveLength(0);
 
     h.api.sendMessage = sendMessage;
     h.fire("session_start");
-    expect(process.env.AGENT_WORKSPACE_PATH).toBe(path.join(root, "omp-session"));
     expect(h.sent).toHaveLength(1);
   });
 
@@ -192,39 +184,24 @@ describe("agent-workspace shared behavior (OMP host)", () => {
 });
 
 describe("agent-workspace OMP lifecycle", () => {
-  it("registers OMP transition listeners lazily and clears only its own environment value", () => {
+  it("registers OMP transition listeners lazily", () => {
     const h = harness("omp-session");
     agentWorkspaceExtension(h.api);
-    expect([...h.handlers.keys()].sort()).toEqual(["session_compact", "session_shutdown", "session_start", "tool_call"]);
+    expect([...h.handlers.keys()].sort()).toEqual(["session_compact", "session_start"]);
 
     h.fire("session_start");
     expect([...h.handlers.keys()].sort()).toEqual([
-      "session_branch", "session_compact", "session_shutdown", "session_start", "session_switch", "session_tree", "tool_call",
+      "session_branch", "session_compact", "session_start", "session_switch", "session_tree",
     ]);
-    const owned = process.env.AGENT_WORKSPACE_PATH!;
-    expect(owned).toBe(path.join(root, "omp-session"));
-
-    // A replacement runtime already exported its own path: leave it alone.
-    process.env.AGENT_WORKSPACE_PATH = "/somewhere/else";
-    h.fire("session_shutdown");
-    expect(process.env.AGENT_WORKSPACE_PATH).toBe("/somewhere/else");
-
-    h.fire("session_switch", { type: "session_switch", reason: "resume" });
-    expect(process.env.AGENT_WORKSPACE_PATH).toBe(owned);
-    h.fire("session_shutdown");
-    expect(process.env.AGENT_WORKSPACE_PATH).toBeUndefined();
-    h.fire("session_shutdown"); // idempotent
-    expect(process.env.AGENT_WORKSPACE_PATH).toBeUndefined();
   });
 
-  it("startup creates an empty workspace, exports the path, and injects one hidden instruction", () => {
+  it("startup creates an empty workspace and injects one hidden instruction", () => {
     const h = harness("omp-session");
     agentWorkspaceExtension(h.api);
     h.fire("session_start");
     h.fire("session_start");
 
     const workspace = path.join(root, "omp-session");
-    expect(process.env.AGENT_WORKSPACE_PATH).toBe(workspace);
     expect(fs.readdirSync(workspace)).toEqual([]);
     expect(h.sent).toHaveLength(1);
     expect(h.sent[0].customType).toBe(WORKSPACE_CONTEXT_MESSAGE_TYPE);
@@ -259,14 +236,14 @@ describe("agent-workspace OMP lifecycle", () => {
     agentWorkspaceExtension(h.api);
     h.fire("session_start");
     const parentEntries = h.state.entries;
-    const parentWorkspace = process.env.AGENT_WORKSPACE_PATH!;
+    const parentWorkspace = h.sent[0].details.workspacePath;
 
     // OMP keeps the runtime and fires session_switch with reason "fork".
     h.state.sessionId = "fork-session";
     h.state.entries = [...parentEntries];
     h.fire("session_switch", { type: "session_switch", reason: "fork", previousSessionFile: "/parent.jsonl" });
     const forkWorkspace = path.join(root, "fork-session");
-    expect(process.env.AGENT_WORKSPACE_PATH).toBe(forkWorkspace);
+
     expect(fs.readdirSync(forkWorkspace)).toEqual([]);
     expect(h.sent).toHaveLength(2);
     expect(h.sent[1].content).toContain(forkWorkspace);
@@ -276,11 +253,10 @@ describe("agent-workspace OMP lifecycle", () => {
     h.fire("session_switch", { type: "session_switch", reason: "fork" });
     expect(h.sent).toHaveLength(2);
 
-    // Switching back to the parent restores its environment without a new instruction.
+    // Switching back to the parent reuses its existing workspace instruction.
     h.state.sessionId = "parent-session";
     h.state.entries = parentEntries;
     h.fire("session_switch", { type: "session_switch", reason: "resume" });
-    expect(process.env.AGENT_WORKSPACE_PATH).toBe(parentWorkspace);
     expect(h.sent).toHaveLength(2);
   });
 
@@ -288,52 +264,14 @@ describe("agent-workspace OMP lifecycle", () => {
     const h = harness("first-session");
     agentWorkspaceExtension(h.api);
     h.fire("session_start");
-    const first = process.env.AGENT_WORKSPACE_PATH!;
+    const first = h.sent[0].details.workspacePath;
 
     h.state.sessionId = "second-session";
     h.state.entries = [];
     h.fire("session_switch", { type: "session_switch", reason: "new" });
-    expect(process.env.AGENT_WORKSPACE_PATH).toBe(path.join(root, "second-session"));
-    expect(process.env.AGENT_WORKSPACE_PATH).not.toBe(first);
+    expect(h.sent[1].details).toEqual({ sessionId: "second-session", workspacePath: path.join(root, "second-session") });
     expect(h.sent).toHaveLength(2);
     expect(fs.existsSync(first)).toBe(true);
-  });
-
-  it("unsets a stale shell export after a failed session switch until recovery", () => {
-    const h = harness("first-session");
-    agentWorkspaceExtension(h.api);
-    h.fire("session_start");
-    const first = process.env.AGENT_WORKSPACE_PATH!;
-    fs.writeFileSync(path.join(root, "second-session"), "blocked");
-    h.state.sessionId = "second-session";
-    h.state.entries = [];
-
-    expect(() => h.fire("session_switch", { reason: "new" })).toThrow();
-    expect(process.env.AGENT_WORKSPACE_PATH).toBeUndefined();
-    expect(h.sent).toHaveLength(1);
-    const command = 'printf "%s\\n" "${AGENT_WORKSPACE_PATH-unset}"';
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const call = { toolName: "bash", input: { command, timeout: 5 } };
-      const result = h.handlers.get("tool_call")!(call, h.context) as unknown as { input: unknown };
-      expect(result.input).toBe(call.input);
-      expect(call.input.timeout).toBe(5);
-      expect(execFileSync("/bin/sh", ["-c", call.input.command], {
-        encoding: "utf8", env: { ...process.env, AGENT_WORKSPACE_PATH: first },
-      })).toBe("unset\n");
-    }
-
-    fs.rmSync(path.join(root, "second-session"));
-    h.fire("session_switch", { reason: "new" });
-    const call = { toolName: "bash", input: { command } };
-    h.fire("tool_call", call);
-    expect(execFileSync("/bin/sh", ["-c", call.input.command], { encoding: "utf8", env: { ...process.env } }))
-      .toBe(path.join(root, "second-session") + "\n");
-    expect(h.sent).toHaveLength(2);
-
-    h.fire("session_shutdown");
-    const afterShutdown = { toolName: "bash", input: { command } };
-    h.fire("tool_call", afterShutdown);
-    expect(afterShutdown.input.command).toBe(command);
   });
 
   it("branching into a new session file (session_branch) gets its own workspace like a fork", () => {
@@ -345,7 +283,6 @@ describe("agent-workspace OMP lifecycle", () => {
     h.state.sessionId = "branch-session";
     h.state.entries = [...parentEntries];
     h.fire("session_branch", { type: "session_branch", previousSessionFile: "/parent.jsonl" });
-    expect(process.env.AGENT_WORKSPACE_PATH).toBe(path.join(root, "branch-session"));
     expect(h.sent).toHaveLength(2);
     expect(h.sent[1].details).toEqual({ sessionId: "branch-session", workspacePath: path.join(root, "branch-session") });
     h.fire("session_branch", { type: "session_branch", previousSessionFile: "/parent.jsonl" });
@@ -365,76 +302,17 @@ describe("agent-workspace OMP lifecycle", () => {
     expect(h.sent).toHaveLength(2);
   });
 
-  it("prefixes an export of the owned path into OMP bash calls and leaves everything else alone", () => {
+  it("does not expose the workspace path through the environment or Bash tool", () => {
     const h = harness("omp-session");
     agentWorkspaceExtension(h.api);
-    const call = { type: "tool_call", toolName: "bash", input: { command: "pwd", timeout: 5, cwd: "/elsewhere" } };
-    const toolCall = (event: unknown) => h.handlers.get("tool_call")?.(event, h.context) as { input: Record<string, unknown> } | undefined;
-
-    // No owned path yet: untouched.
-    expect(toolCall(call)).toBeUndefined();
-    expect(call.input.command).toBe("pwd");
+    expect(process.env.AGENT_WORKSPACE_PATH).toBeUndefined();
 
     h.fire("session_start");
-    const owned = process.env.AGENT_WORKSPACE_PATH!;
-    const result = toolCall(call);
-    const expected = `export AGENT_WORKSPACE_PATH='${owned}';\npwd`;
-    expect(result).toEqual({ input: { command: expected, timeout: 5, cwd: "/elsewhere" } });
-    expect(result!.input).toBe(call.input); // same object: mutate and return, composable with other handlers
-    expect(expected.split("\n")).toHaveLength(2); // exactly one export line, no subshell, no cd
+    expect(process.env.AGENT_WORKSPACE_PATH).toBeUndefined();
+    expect(h.handlers.has("tool_call")).toBe(false);
 
-    // Inline override is preserved verbatim and still follows (so wins over) the export.
-    const inline = { toolName: "bash", input: { command: "AGENT_WORKSPACE_PATH=/x ./script.sh" } };
-    expect(toolCall(inline)?.input.command).toBe(`export AGENT_WORKSPACE_PATH='${owned}';\nAGENT_WORKSPACE_PATH=/x ./script.sh`);
-
-    // Non-bash tools and malformed inputs are untouched.
-    const read = { toolName: "read", input: { path: "/etc/hosts" } };
-    expect(toolCall(read)).toBeUndefined();
-    expect(read.input).toEqual({ path: "/etc/hosts" });
-    expect(toolCall({ toolName: "bash", input: {} })).toBeUndefined();
-
-    // Quoting: a path containing a single quote.
-    process.env.AGENT_WORKSPACE_ROOT = path.join(root, "it's");
-    h.fire("session_switch", { type: "session_switch", reason: "resume" });
-    const quoted = toolCall({ toolName: "bash", input: { command: "true" } })?.input.command as string;
-    expect(quoted).toBe(`export AGENT_WORKSPACE_PATH='${path.join(root, "it'\\''s", "omp-session")}';\ntrue`);
-
-    // Follows the current session after a switch.
-    h.state.sessionId = "other-session";
-    h.state.entries = [];
-    h.fire("session_switch", { type: "session_switch", reason: "new" });
-    expect(toolCall({ toolName: "bash", input: { command: "true" } })?.input.command).toContain("/other-session';\n");
-  });
-
-  it("composes with another rewriting tool_call handler in either order", () => {
-    // Sibling adapters (Agent Mail/ID) follow the same contract: mutate event.input, return the same object.
-    const mailStyle = (event: { input: Record<string, unknown> }) => {
-      if (!/(?:^|[;&|\n])\s*agent-mail(?=\s|$)/.test(event.input.command as string)) return;
-      event.input.command = `(\nexport AGENT_MAIL_ID='mail-id'\n${event.input.command}\n)`;
-      return { input: event.input };
-    };
-    const h = harness("omp-session");
-    agentWorkspaceExtension(h.api);
-    h.fire("session_start");
-    const owned = process.env.AGENT_WORKSPACE_PATH!;
-    const ours = (event: { input: Record<string, unknown> }) => h.handlers.get("tool_call")!(event, h.context);
-    const bin = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-test-mail-"));
-    fs.writeFileSync(path.join(bin, "agent-mail"), '#!/bin/sh\necho "mail=${AGENT_MAIL_ID-unset} ws=${AGENT_WORKSPACE_PATH-unset}"\n', { mode: 0o755 });
-    const run = (command: string) =>
-      execFileSync("/bin/sh", ["-c", command], { encoding: "utf-8", env: { PATH: `${bin}:/usr/bin:/bin` } }).trim();
-
-    try {
-      for (const order of [[ours, mailStyle], [mailStyle, ours]]) {
-        const call = { toolName: "bash", input: { command: "agent-mail send --to me" } };
-        let last: unknown;
-        for (const handler of order) last = handler(call) ?? last;
-        expect((last as { input: unknown }).input).toBe(call.input); // last result still carries both rewrites
-        expect(call.input.command).toContain(`export AGENT_WORKSPACE_PATH='${owned}';`);
-        expect(call.input.command).toContain("export AGENT_MAIL_ID='mail-id'");
-        expect(run(call.input.command as string)).toBe(`mail=mail-id ws=${owned}`);
-      }
-    } finally {
-      fs.rmSync(bin, { recursive: true, force: true });
-    }
+    const call = { toolName: "bash", input: { command: "pwd", timeout: 5 } };
+    h.fire("tool_call", call);
+    expect(call.input).toEqual({ command: "pwd", timeout: 5 });
   });
 });

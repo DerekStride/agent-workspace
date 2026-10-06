@@ -11,7 +11,7 @@ import agentWorkspaceExtension, {
   sanitizePathComponent,
   WORKSPACE_CONTEXT_MESSAGE_TYPE,
 } from "../extensions/agent-workspace.ts";
-import { createHostAdapter, exportPrefix } from "../extensions/lib/host.ts";
+import { createHostAdapter } from "../extensions/lib/host.ts";
 import { createHarness, fakeAgentIdPath, legacyInstruction, restoreEnv, saveEnv } from "./fixtures.ts";
 
 // Pi contexts have no managed timers; the adapter therefore selects Pi lifecycle events.
@@ -68,7 +68,6 @@ test("uses the agent-id slug when the lookup succeeds", () => {
     const h = harness("pi-session");
     agentWorkspaceExtension(h.api);
     h.fire("session_start", { type: "session_start", reason: "startup" });
-    assert.equal(process.env.AGENT_WORKSPACE_PATH, path.join(root, "oriole-thatcher-lighthouse"));
     assert.deepEqual(h.sent[0].details, { sessionId: "pi-session", workspacePath: path.join(root, "oriole-thatcher-lighthouse") });
   } finally {
     fs.rmSync(fake.bin, { recursive: true, force: true });
@@ -110,7 +109,6 @@ test("refreshes guidance when the resolved path changes and keeps old directorie
     agentWorkspaceExtension(h.api);
     h.fire("session_start", { type: "session_start", reason: "resume" });
     const slugPath = path.join(root, "late-slug");
-    assert.equal(process.env.AGENT_WORKSPACE_PATH, slugPath);
     assert.equal(h.sent.length, 2);
     assert.equal(h.sent[1].details.workspacePath, slugPath);
     assert.ok(h.sent[1].content.includes(slugPath));
@@ -127,7 +125,6 @@ test("refreshes guidance when the resolved path changes and keeps old directorie
   process.env.PATH = "";
   agentWorkspaceExtension(h.api);
   h.fire("session_start", { type: "session_start", reason: "resume" });
-  assert.equal(process.env.AGENT_WORKSPACE_PATH, rawPath);
   assert.equal(h.sent.length, 3);
   assert.equal(h.sent[2].details.workspacePath, rawPath);
 
@@ -143,44 +140,37 @@ test("refreshes guidance when the resolved path changes and keeps old directorie
   }
 });
 
-test("clears its owned path when reprovisioning fails and recovers on retry", () => {
+test("failed reprovisioning preserves workspace files and recovers on retry", () => {
   const h = harness("pi-session");
   agentWorkspaceExtension(h.api);
   h.fire("session_start", { reason: "startup" });
-  const owned = process.env.AGENT_WORKSPACE_PATH!;
-  fs.writeFileSync(path.join(owned, "keep.txt"), "keep my work");
+  const workspace = path.join(root, "pi-session");
+  fs.writeFileSync(path.join(workspace, "keep.txt"), "keep my work");
   h.state.entries.push({ type: "compaction" });
   const blockedRoot = path.join(root, "not-a-directory");
   fs.writeFileSync(blockedRoot, "blocked");
   process.env.AGENT_WORKSPACE_ROOT = blockedRoot;
 
   assert.throws(() => h.fire("session_compact"));
-  assert.equal(process.env.AGENT_WORKSPACE_PATH, undefined);
   assert.equal(h.sent.length, 1);
-  const call = { toolName: "bash", input: { command: "pwd", timeout: 5 } };
-  assert.equal(h.handlers.get("tool_call")!(call, h.context), undefined);
-  assert.deepEqual(call.input, { command: "pwd", timeout: 5 });
 
   process.env.AGENT_WORKSPACE_ROOT = root;
   h.fire("session_compact");
-  assert.equal(process.env.AGENT_WORKSPACE_PATH, owned);
   assert.equal(h.sent.length, 2);
-  assert.equal(fs.readFileSync(path.join(owned, "keep.txt"), "utf8"), "keep my work");
+  assert.equal(fs.readFileSync(path.join(workspace, "keep.txt"), "utf8"), "keep my work");
 });
 
-test("does not export a workspace until its context is published", () => {
+test("does not publish workspace guidance until setup succeeds", () => {
   const h = harness("pi-session");
   const sendMessage = h.api.sendMessage;
   h.api.sendMessage = () => { throw new Error("context unavailable"); };
   agentWorkspaceExtension(h.api);
 
   assert.throws(() => h.fire("session_start", { reason: "startup" }), /context unavailable/);
-  assert.equal(process.env.AGENT_WORKSPACE_PATH, undefined);
   assert.equal(h.sent.length, 0);
 
   h.api.sendMessage = sendMessage;
   h.fire("session_start", { reason: "startup" });
-  assert.equal(process.env.AGENT_WORKSPACE_PATH, path.join(root, "pi-session"));
   assert.equal(h.sent.length, 1);
 });
 
@@ -208,23 +198,20 @@ test("detects Pi from a context without managed timers", () => {
 test("registers Pi transition listeners lazily on the first session_start", () => {
   const h = harness("pi-session");
   agentWorkspaceExtension(h.api);
-  assert.deepEqual([...h.handlers.keys()].sort(), ["session_compact", "session_shutdown", "session_start", "tool_call"]);
+  assert.deepEqual([...h.handlers.keys()].sort(), ["session_compact", "session_start"]);
 
   h.fire("session_start", { type: "session_start", reason: "startup" });
   assert.deepEqual([...h.handlers.keys()].sort(), [
-    "session_compact", "session_shutdown", "session_start", "session_tree", "tool_call",
+    "session_compact", "session_start", "session_tree",
   ]);
-  assert.equal(h.handlers.has("session_switch"), false);
-  assert.equal(h.handlers.has("session_branch"), false);
 });
 
-test("startup creates an empty workspace, exports the path, and injects one hidden instruction", () => {
+test("startup creates an empty workspace and injects one hidden instruction", () => {
   const h = harness("pi-session");
   agentWorkspaceExtension(h.api);
   h.fire("session_start", { type: "session_start", reason: "startup" });
 
   const workspace = path.join(root, "pi-session");
-  assert.equal(process.env.AGENT_WORKSPACE_PATH, workspace);
   assert.deepEqual(fs.readdirSync(workspace), []);
   assert.equal(h.sent.length, 1);
   assert.equal(h.sent[0].customType, WORKSPACE_CONTEXT_MESSAGE_TYPE);
@@ -232,12 +219,9 @@ test("startup creates an empty workspace, exports the path, and injects one hidd
   assert.deepEqual(h.sent[0].details, { sessionId: "pi-session", workspacePath: workspace });
   assert.ok(h.sent[0].content.includes(workspace));
 
-  // Reload replaces the runtime: shutdown then a fresh instance starting on the same branch.
-  h.fire("session_shutdown", { type: "session_shutdown", reason: "reload" });
-  assert.equal(process.env.AGENT_WORKSPACE_PATH, undefined);
+  // Reload replaces the runtime: a fresh instance starts on the same branch.
   agentWorkspaceExtension(h.api);
   h.fire("session_start", { type: "session_start", reason: "reload" });
-  assert.equal(process.env.AGENT_WORKSPACE_PATH, workspace);
   assert.equal(h.sent.length, 1);
 });
 
@@ -266,17 +250,15 @@ test("fork starts a new runtime and gets its own workspace despite inherited his
   const h = harness("parent-session");
   agentWorkspaceExtension(h.api);
   h.fire("session_start", { type: "session_start", reason: "startup" });
-  const parentWorkspace = process.env.AGENT_WORKSPACE_PATH!;
+  const parentWorkspace = h.sent[0].details.workspacePath;
   const parentEntries = h.state.entries;
 
-  h.fire("session_shutdown", { type: "session_shutdown", reason: "fork" });
   h.state.sessionId = "fork-session";
   h.state.entries = [...parentEntries];
   agentWorkspaceExtension(h.api);
   h.fire("session_start", { type: "session_start", reason: "fork", previousSessionFile: "/parent.jsonl" });
 
   const forkWorkspace = path.join(root, "fork-session");
-  assert.equal(process.env.AGENT_WORKSPACE_PATH, forkWorkspace);
   assert.deepEqual(fs.readdirSync(forkWorkspace), []);
   assert.equal(h.sent.length, 2);
   assert.ok(h.sent[1].content.includes(forkWorkspace));
@@ -291,16 +273,14 @@ test("new session replaces the runtime and points at a different workspace", () 
   const h = harness("first-session");
   agentWorkspaceExtension(h.api);
   h.fire("session_start", { type: "session_start", reason: "startup" });
-  const first = process.env.AGENT_WORKSPACE_PATH!;
+  const first = h.sent[0].details.workspacePath;
 
-  h.fire("session_shutdown", { type: "session_shutdown", reason: "new" });
   h.state.sessionId = "second-session";
   h.state.entries = [];
   agentWorkspaceExtension(h.api);
   h.fire("session_start", { type: "session_start", reason: "new" });
 
-  assert.equal(process.env.AGENT_WORKSPACE_PATH, path.join(root, "second-session"));
-  assert.notEqual(process.env.AGENT_WORKSPACE_PATH, first);
+  assert.deepEqual(h.sent[1].details, { sessionId: "second-session", workspacePath: path.join(root, "second-session") });
   assert.equal(h.sent.length, 2);
   assert.ok(fs.existsSync(first));
 });
@@ -318,46 +298,16 @@ test("tree navigation re-checks the active branch without duplicating instructio
   assert.equal(h.sent.length, 2);
 });
 
-test("shutdown clears only the environment value this instance exported", () => {
+test("does not expose the workspace path through the environment or Bash tool", () => {
   const h = harness("pi-session");
   agentWorkspaceExtension(h.api);
-  h.fire("session_start", { type: "session_start", reason: "startup" });
-  const owned = process.env.AGENT_WORKSPACE_PATH!;
-
-  process.env.AGENT_WORKSPACE_PATH = "/owned/by/another/instance";
-  h.fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
-  assert.equal(process.env.AGENT_WORKSPACE_PATH, "/owned/by/another/instance");
-
-  process.env.AGENT_WORKSPACE_PATH = owned;
-  agentWorkspaceExtension(h.api);
-  h.fire("session_start", { type: "session_start", reason: "startup" });
-  h.fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
   assert.equal(process.env.AGENT_WORKSPACE_PATH, undefined);
-  h.fire("session_shutdown", { type: "session_shutdown", reason: "quit" }); // idempotent
-  assert.equal(process.env.AGENT_WORKSPACE_PATH, undefined);
-});
 
-test("leaves bash tool calls untouched on Pi (native process environment)", () => {
-  const h = harness("pi-session");
-  agentWorkspaceExtension(h.api);
   h.fire("session_start", { type: "session_start", reason: "startup" });
-  const call = { type: "tool_call", toolName: "bash", input: { command: "pwd", timeout: 5 } };
-  const result = h.handlers.get("tool_call")?.(call, h.context);
-  assert.equal(result, undefined);
+  assert.equal(process.env.AGENT_WORKSPACE_PATH, undefined);
+  assert.equal(h.handlers.has("tool_call"), false);
+
+  const call = { toolName: "bash", input: { command: "pwd", timeout: 5 } };
+  h.fire("tool_call", call);
   assert.deepEqual(call.input, { command: "pwd", timeout: 5 });
-  // Composition: a sibling handler that mutates in place on Pi still sees the untouched command.
-  const mailStyle = (event: { input: Record<string, unknown> }) => { event.input.command = `(\n${event.input.command}\n)`; };
-  for (const order of [[() => h.handlers.get("tool_call")!(call, h.context), () => mailStyle(call)], [() => mailStyle(call), () => h.handlers.get("tool_call")!(call, h.context)]]) {
-    call.input.command = "pwd";
-    for (const step of order) step();
-    assert.equal(call.input.command, "(\npwd\n)");
-  }
-  const read = { toolName: "read", input: { path: "/etc/hosts" } };
-  assert.equal(h.handlers.get("tool_call")?.(read, h.context), undefined);
-  assert.deepEqual(read.input, { path: "/etc/hosts" });
-});
-
-test("export prefix quotes paths safely and ends with a newline", () => {
-  assert.equal(exportPrefix("/tmp/plain"), "export AGENT_WORKSPACE_PATH='/tmp/plain';\n");
-  assert.equal(exportPrefix("/tmp/it's"), "export AGENT_WORKSPACE_PATH='/tmp/it'\\''s';\n");
 });
